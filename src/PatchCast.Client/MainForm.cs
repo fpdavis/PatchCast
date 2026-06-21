@@ -19,7 +19,8 @@ public sealed class MainForm : Form
     private readonly Button connectButton = new() { Text = "Connect", Dock = DockStyle.Fill };
     private readonly CheckBox systemMute = new() { Text = "Mute system audio", AutoSize = true };
     private readonly CheckBox micMute = new() { Text = "Mute microphone", AutoSize = true };
-    private readonly Button showLogButton = new() { Text = "Show Log", Dock = DockStyle.Fill };
+    private readonly Button showLogButton = new() { Text = "Show Log", AutoSize = true };
+    private readonly Button forgetCertificateButton = new() { Text = "Forget Trusted Certificate", AutoSize = true };
     private readonly TrackBar systemVolume = NewVolumeControl();
     private readonly TrackBar micVolume = NewVolumeControl();
     private readonly Label connectionState = new() { Text = "Disconnected", AutoSize = true, Anchor = AnchorStyles.Left };
@@ -73,12 +74,16 @@ public sealed class MainForm : Form
         AddRow(layout, 7, string.Empty, micMute);
         AddRow(layout, 8, "Status", connectionState);
         AddRow(layout, 9, "Connection quality", connectionQuality);
-        AddRow(layout, 10, "Activity and errors", showLogButton);
+        var activityButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        activityButtons.Controls.Add(showLogButton);
+        activityButtons.Controls.Add(forgetCertificateButton);
+        AddRow(layout, 10, "Activity and errors", activityButtons);
         AddSpanningRow(layout, 11, connectButton);
         Controls.Add(layout);
 
         connectButton.Click += (_, _) => ToggleConnection();
         showLogButton.Click += (_, _) => ShowLog();
+        forgetCertificateButton.Click += (_, _) => ForgetTrustedCertificate();
         systemVolume.ValueChanged += (_, _) => systemPlayer.SetVolume(systemVolume.Value / 100f);
         micVolume.ValueChanged += (_, _) => micPlayer.SetVolume(micVolume.Value / 100f);
         systemMute.CheckedChanged += (_, _) => systemPlayer.SetMuted(systemMute.Checked);
@@ -143,6 +148,7 @@ public sealed class MainForm : Form
                 connectionQuality.Text = "Negotiating connection";
                 activityLog.Write($"Connection attempt {attempt} to {host}:{port} started.");
                 var authenticatedAt = DateTimeOffset.MinValue;
+                var certificatePinMismatch = false;
 
                 try
                 {
@@ -158,8 +164,9 @@ public sealed class MainForm : Form
                         if (certificate is null)
                             return false;
                         observedPin = certificate.GetCertHashString(HashAlgorithmName.SHA256);
-                        return !settings.CertificatePins.TryGetValue(pinKey, out var savedPin)
-                            || string.Equals(savedPin, observedPin, StringComparison.OrdinalIgnoreCase);
+                        certificatePinMismatch = settings.CertificatePins.TryGetValue(pinKey, out var savedPin)
+                            && !string.Equals(savedPin, observedPin, StringComparison.OrdinalIgnoreCase);
+                        return !certificatePinMismatch;
                     });
                     await secureStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
                     {
@@ -225,7 +232,9 @@ public sealed class MainForm : Form
                     connectionQuality.Text = "Not connected";
                     var delay = RetryDelaysSeconds[retryIndex];
                     retryIndex = Math.Min(retryIndex + 1, RetryDelaysSeconds.Length - 1);
-                    var error = FriendlyError(exception);
+                    var error = certificatePinMismatch
+                        ? "The server certificate changed and was rejected. Disconnect, verify that the server was intentionally changed, then use Forget Trusted Certificate."
+                        : FriendlyError(exception);
                     activityLog.Write($"{error} Exception: {exception.GetType().Name}: {exception.Message}");
                     activityLog.Write($"Next connection attempt in {delay} second(s).");
                     await ShowRetryCountdownAsync(delay, session.Token);
@@ -309,6 +318,33 @@ public sealed class MainForm : Form
         portInput.Enabled = enabled;
         passwordText.Enabled = enabled;
         savePassword.Enabled = enabled;
+        forgetCertificateButton.Enabled = enabled;
+    }
+
+    private void ForgetTrustedCertificate()
+    {
+        var host = hostText.Text.Trim();
+        var pinKey = $"{host}:{(int)portInput.Value}";
+        if (!settings.CertificatePins.ContainsKey(pinKey))
+        {
+            MessageBox.Show(this, $"No trusted certificate is saved for {pinKey}.", "PatchCast", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"Forget the trusted certificate for {pinKey}?\n\nOnly continue if you intentionally changed or reinstalled the server. The next password-authenticated connection will trust and pin the certificate presented by that server.",
+            "PatchCast Certificate Trust",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (confirmation != DialogResult.Yes)
+            return;
+
+        settings.CertificatePins.Remove(pinKey);
+        ClientSettingsStore.Save(settings);
+        activityLog.Write($"Forgot the trusted server certificate for {pinKey} at the user's request.");
+        MessageBox.Show(this, "The saved certificate was removed. You can now connect and pin the server's current certificate.", "PatchCast", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private static string FriendlyError(Exception exception) => exception switch

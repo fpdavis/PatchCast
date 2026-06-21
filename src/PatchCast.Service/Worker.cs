@@ -32,12 +32,25 @@ public sealed class Worker(
             while (!stoppingToken.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(stoppingToken);
-                _ = HandleClientAsync(client, stoppingToken);
+                _ = HandleClientSafelyAsync(client, stoppingToken);
             }
         }
         finally
         {
             listener.Stop();
+        }
+    }
+
+    private async Task HandleClientSafelyAsync(TcpClient client, CancellationToken serviceToken)
+    {
+        try
+        {
+            await HandleClientAsync(client, serviceToken);
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Unhandled failure while processing client {Endpoint}.", client.Client.RemoteEndPoint);
+            client.Dispose();
         }
     }
 
@@ -59,6 +72,9 @@ public sealed class Worker(
         using (var microphone = new WasapiCapture())
         using (var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(serviceToken))
         {
+            var stoppingCaptures = 0;
+            var loopbackStarted = false;
+            var microphoneStarted = false;
             var loopbackFormat = SerializeWaveFormat(loopback.WaveFormat);
             var microphoneFormat = SerializeWaveFormat(microphone.WaveFormat);
 
@@ -68,10 +84,38 @@ public sealed class Worker(
                 packets.Writer.TryWrite(new AudioPacket(channel, format, data));
             }
 
-            loopback.DataAvailable += (_, args) => Queue(AudioChannel.SystemAudio, loopbackFormat, args);
-            microphone.DataAvailable += (_, args) => Queue(AudioChannel.Microphone, microphoneFormat, args);
-            loopback.RecordingStopped += (_, args) => HandleCaptureStopped("system audio", args.Exception, linkedCancellation);
-            microphone.RecordingStopped += (_, args) => HandleCaptureStopped("microphone", args.Exception, linkedCancellation);
+            void LoopbackDataAvailable(object? _, WaveInEventArgs args) =>
+                Queue(AudioChannel.SystemAudio, loopbackFormat, args);
+
+            void MicrophoneDataAvailable(object? _, WaveInEventArgs args) =>
+                Queue(AudioChannel.Microphone, microphoneFormat, args);
+
+            void CaptureStopped(string source, Exception? exception)
+            {
+                if (Volatile.Read(ref stoppingCaptures) != 0)
+                    return;
+                if (exception is not null)
+                    logger.LogError(exception, "Capture of {Source} stopped unexpectedly.", source);
+                try
+                {
+                    linkedCancellation.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // A late device callback can race with client teardown.
+                }
+            }
+
+            void LoopbackStopped(object? _, StoppedEventArgs args) =>
+                CaptureStopped("system audio", args.Exception);
+
+            void MicrophoneStopped(object? _, StoppedEventArgs args) =>
+                CaptureStopped("microphone", args.Exception);
+
+            loopback.DataAvailable += LoopbackDataAvailable;
+            microphone.DataAvailable += MicrophoneDataAvailable;
+            loopback.RecordingStopped += LoopbackStopped;
+            microphone.RecordingStopped += MicrophoneStopped;
 
             try
             {
@@ -94,7 +138,9 @@ public sealed class Worker(
                 }
 
                 loopback.StartRecording();
+                loopbackStarted = true;
                 microphone.StartRecording();
+                microphoneStarted = true;
 
                 await foreach (var packet in packets.Reader.ReadAllAsync(linkedCancellation.Token))
                     await AudioProtocol.WriteAsync(secureStream, packet, linkedCancellation.Token);
@@ -102,25 +148,50 @@ public sealed class Worker(
             catch (OperationCanceledException) when (linkedCancellation.IsCancellationRequested)
             {
             }
+            catch (Exception exception) when (IsExpectedClientDisconnect(exception))
+            {
+                logger.LogInformation("Client {Endpoint} closed the connection.", endpoint);
+            }
             catch (Exception exception)
             {
                 logger.LogWarning(exception, "Client {Endpoint} disconnected or audio capture failed.", endpoint);
             }
             finally
             {
-                loopback.StopRecording();
-                microphone.StopRecording();
+                Interlocked.Exchange(ref stoppingCaptures, 1);
+                loopback.DataAvailable -= LoopbackDataAvailable;
+                microphone.DataAvailable -= MicrophoneDataAvailable;
+                loopback.RecordingStopped -= LoopbackStopped;
+                microphone.RecordingStopped -= MicrophoneStopped;
+                if (loopbackStarted)
+                    loopback.StopRecording();
+                if (microphoneStarted)
+                    microphone.StopRecording();
                 packets.Writer.TryComplete();
                 logger.LogInformation("Client {Endpoint} disconnected.", endpoint);
             }
         }
     }
 
-    private void HandleCaptureStopped(string source, Exception? exception, CancellationTokenSource cancellation)
+    private static bool IsExpectedClientDisconnect(Exception exception)
     {
-        if (exception is not null)
-            logger.LogError(exception, "Capture of {Source} stopped unexpectedly.", source);
-        cancellation.Cancel();
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is IOException)
+                return true;
+
+            if (current is SocketException socketException && socketException.SocketErrorCode is
+                SocketError.ConnectionAborted or
+                SocketError.ConnectionReset or
+                SocketError.OperationAborted or
+                SocketError.Shutdown or
+                SocketError.NotConnected)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static byte[] SerializeWaveFormat(WaveFormat format)

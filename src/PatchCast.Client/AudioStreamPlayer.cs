@@ -1,12 +1,18 @@
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using PatchCast.Protocol;
+using System.Runtime.InteropServices;
 
 namespace PatchCast.Client;
 
 internal sealed class AudioStreamPlayer : IDisposable
 {
-    private WaveOutEvent? output;
+    private WasapiOut? output;
     private BufferedWaveProvider? buffer;
+    private MediaFoundationResampler? resampler;
+    private MMDevice? outputDevice;
+    private VolumeSampleProvider? streamVolume;
     private byte[]? currentFormat;
     private float volume = 1f;
     private bool muted;
@@ -34,7 +40,12 @@ internal sealed class AudioStreamPlayer : IDisposable
     {
         output?.Stop();
         output?.Dispose();
+        resampler?.Dispose();
+        outputDevice?.Dispose();
         output = null;
+        resampler = null;
+        outputDevice = null;
+        streamVolume = null;
         buffer = null;
         currentFormat = null;
     }
@@ -42,16 +53,49 @@ internal sealed class AudioStreamPlayer : IDisposable
     private void Reset(byte[] serializedFormat)
     {
         Stop();
-        using var stream = new MemoryStream(serializedFormat, writable: false);
-        using var reader = new BinaryReader(stream);
-        var waveFormat = WaveFormat.FromFormatChunk(reader, serializedFormat.Length);
-        buffer = new BufferedWaveProvider(waveFormat)
+        if (serializedFormat.Length < sizeof(int))
+            throw new InvalidDataException("The server sent an incomplete audio format.");
+        var formatChunkLength = BitConverter.ToInt32(serializedFormat, 0);
+        if (formatChunkLength <= 0 || formatChunkLength != serializedFormat.Length - sizeof(int))
+            throw new InvalidDataException("The server sent an invalid audio format chunk.");
+        var formatPointer = Marshal.AllocHGlobal(formatChunkLength);
+        WaveFormat wireFormat;
+        try
+        {
+            Marshal.Copy(serializedFormat, sizeof(int), formatPointer, formatChunkLength);
+            wireFormat = WaveFormat.MarshalFromPtr(formatPointer);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(formatPointer);
+        }
+        var playbackFormat = wireFormat is WaveFormatExtensible extensible
+            ? extensible.ToStandardWaveFormat()
+            : wireFormat;
+        buffer = new BufferedWaveProvider(playbackFormat)
         {
             BufferDuration = TimeSpan.FromSeconds(2),
             DiscardOnBufferOverflow = true
         };
-        output = new WaveOutEvent { DesiredLatency = 150 };
-        output.Init(buffer);
+        using var deviceEnumerator = new MMDeviceEnumerator();
+        outputDevice = deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        var outputFormat = outputDevice.AudioClient.MixFormat;
+
+        // Apply gain in software to this stream only. WasapiOut.Volume controls
+        // the client's endpoint volume and must not be used for PatchCast sliders.
+        streamVolume = new VolumeSampleProvider(buffer.ToSampleProvider());
+        ApplyVolume();
+        var volumeWaveProvider = new SampleToWaveProvider(streamVolume);
+
+        // Convert the server's capture format to the exact mix format accepted by
+        // the client's default output device. This handles different sample rates,
+        // channel counts, and WAVE_FORMAT_EXTENSIBLE layouts between computers.
+        resampler = new MediaFoundationResampler(volumeWaveProvider, outputFormat)
+        {
+            ResamplerQuality = 60
+        };
+        output = new WasapiOut(outputDevice, AudioClientShareMode.Shared, useEventSync: false, latency: 150);
+        output.Init(resampler);
         ApplyVolume();
         output.Play();
         currentFormat = serializedFormat.ToArray();
@@ -59,8 +103,8 @@ internal sealed class AudioStreamPlayer : IDisposable
 
     private void ApplyVolume()
     {
-        if (output is not null)
-            output.Volume = muted ? 0f : volume;
+        if (streamVolume is not null)
+            streamVolume.Volume = muted ? 0f : volume;
     }
 
     public void Dispose() => Stop();

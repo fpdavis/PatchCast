@@ -25,5 +25,7 @@
 
   <ItemGroup>
     <Content Update="appsettings.Development.json" CopyToPublishDirectory="Never" />
+    <Content Include="Install-Service.ps1" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Uninstall-Service.ps1" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
