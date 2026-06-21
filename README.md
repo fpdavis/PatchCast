@@ -21,7 +21,7 @@ dotnet build PatchCast.sln -c Release
 
 Set `PatchCast:Port` and `PatchCast:Password` in `src/PatchCast.Service/appsettings.json`. Change the example password before deployment. The default port is TCP `4747`; permit the selected inbound TCP port in Windows Defender Firewall.
 
-The server automatically creates a five-year self-signed TLS certificate in the service account's Windows Current User certificate store. There is no certificate file or private key to maintain manually. The client trusts the certificate on the first successful password-authenticated connection and pins its SHA-256 fingerprint. A later certificate change is rejected to expose possible interception. If an intentional account change or server reinstall changes the certificate, disconnect and use **Forget Trusted Certificate** before reconnecting. Client pins and the last host/port are stored under `%LOCALAPPDATA%\PatchCast\client-settings.json`.
+The server automatically creates a five-year self-signed TLS certificate in the service account's Windows Current User certificate store. There is no certificate file or private key to maintain manually. The client trusts the certificate on the first successful password-authenticated connection and pins its SHA-256 fingerprint. A later certificate change by the server will trigger a **Forget Trusted Certificate** process before reconnecting. Saved server configurations and the last host are stored under `%LOCALAPPDATA%\PatchCast\client-settings.json`.
 
 For an interactive test:
 
