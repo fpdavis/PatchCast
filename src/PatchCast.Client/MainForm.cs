@@ -12,43 +12,54 @@ public sealed class MainForm : Form
 {
     private static readonly int[] RetryDelaysSeconds = [0, 1, 2, 4, 8, 16, 32];
 
-    private readonly ComboBox hostInput = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDown };
+    // The player already supplies a steady incoming-level envelope; the UI eases
+    // toward it each tick (at ~60 fps) so motion between device reads glides
+    // instead of stepping.
+    private const float MeterSmoothing = 0.2f;
+
+    private static readonly AnchorStyles HorizontalFill = AnchorStyles.Left | AnchorStyles.Right;
+
+    private readonly ComboBox hostInput = new() { Anchor = HorizontalFill, DropDownStyle = ComboBoxStyle.DropDown };
     private readonly Button removeHostButton = new() { Text = "Remove", Dock = DockStyle.Fill };
-    private readonly NumericUpDown portInput = new() { Minimum = 1, Maximum = 65535, Dock = DockStyle.Fill };
-    private readonly TextBox passwordText = new() { UseSystemPasswordChar = true, Dock = DockStyle.Fill };
+    private readonly NumericUpDown portInput = new() { Minimum = 1, Maximum = 65535, Anchor = HorizontalFill };
+    private readonly TextBox passwordText = new() { UseSystemPasswordChar = true, Anchor = HorizontalFill };
     private readonly CheckBox savePassword = new() { AutoSize = true, AccessibleName = "Save Password" };
     private readonly Button connectButton = new() { Text = "Connect", Dock = DockStyle.Fill };
     private readonly CheckBox systemMute = new() { AutoSize = true, AccessibleName = "Mute System Audio" };
     private readonly CheckBox micMute = new() { AutoSize = true, AccessibleName = "Mute Microphone" };
     private readonly Button showLogButton = new() { Text = "Show Log", Dock = DockStyle.Fill };
-    private readonly TrackBar systemVolume = NewVolumeControl();
-    private readonly TrackBar micVolume = NewVolumeControl();
+    private readonly VolumeSlider systemVolume = NewVolumeControl();
+    private readonly VolumeSlider micVolume = NewVolumeControl();
     private readonly Label connectionState = NewValueLabel("Disconnected");
     private readonly Label connectionQuality = NewValueLabel("Not Connected");
     private readonly ToolTip helpTips = new();
+    private readonly System.Windows.Forms.Timer levelTimer = new() { Interval = 16 };
     private readonly AudioStreamPlayer systemPlayer = new();
     private readonly AudioStreamPlayer micPlayer = new();
     private readonly ClientSettings settings;
     private readonly Dictionary<string, string> currentRunPasswords = new(StringComparer.OrdinalIgnoreCase);
     private readonly ClientActivityLog activityLog = new();
     private CancellationTokenSource? sessionCancellation;
-    private TcpClient? activeClient;
     private LogForm? logForm;
     private bool loadingHost;
+    private float systemMeterLevel;
+    private float micMeterLevel;
 
     public MainForm()
     {
         settings = ClientSettingsStore.Load();
 
         Text = "PatchCast Client";
-        ClientSize = new Size(650, 335);
-        MinimumSize = new Size(560, 374);
+        ClientSize = new Size(650, 340);
+        MinimumSize = new Size(560, 379);
         StartPosition = FormStartPosition.CenterScreen;
 
         helpTips.SetToolTip(savePassword, "Save this server password securely for the current Windows user using DPAPI.");
         helpTips.SetToolTip(systemMute, "Mute or unmute only the system-audio stream received from this server.");
         helpTips.SetToolTip(micMute, "Mute or unmute only the microphone stream received from this server.");
         helpTips.SetToolTip(removeHostButton, "Remove this host and all of its saved settings, password, and certificate trust.");
+        helpTips.SetToolTip(systemVolume, "System-audio volume. The bar shows the incoming level before volume and mute are applied.");
+        helpTips.SetToolTip(micVolume, "Microphone volume. The bar shows the incoming level before volume and mute are applied.");
 
         var layout = new TableLayoutPanel
         {
@@ -62,8 +73,8 @@ public sealed class MainForm : Form
         AddRow(layout, 0, "Server Host Or IP:", CreateHostPanel(), 40);
         AddRow(layout, 1, "TCP Port:", portInput, 36);
         AddRow(layout, 2, "Server Password:", CreatePasswordPanel(), 36);
-        AddRow(layout, 3, "System Volume:", CreateVolumePanel(systemMute, systemVolume), 48);
-        AddRow(layout, 4, "Microphone Volume:", CreateVolumePanel(micMute, micVolume), 48);
+        AddRow(layout, 3, "System Volume:", CreateVolumePanel(systemMute, systemVolume), 44);
+        AddRow(layout, 4, "Microphone Volume:", CreateVolumePanel(micMute, micVolume), 44);
         AddRow(layout, 5, "Status:", connectionState, 32);
         AddRow(layout, 6, "Connection Quality:", connectionQuality, 36);
         AddSpanningRow(layout, 7, CreateActionPanel(), 42);
@@ -82,6 +93,8 @@ public sealed class MainForm : Form
         micVolume.ValueChanged += (_, _) => micPlayer.SetVolume(micVolume.Value / 100f);
         systemMute.CheckedChanged += (_, _) => systemPlayer.SetMuted(systemMute.Checked);
         micMute.CheckedChanged += (_, _) => micPlayer.SetMuted(micMute.Checked);
+        levelTimer.Tick += (_, _) => UpdateLevelMeters();
+        levelTimer.Start();
         FormClosing += (_, _) => RequestDisconnect();
 
         RefreshHostItems(settings.LastHost);
@@ -114,9 +127,9 @@ public sealed class MainForm : Form
         return panel;
     }
 
-    private static Control CreateVolumePanel(CheckBox mute, TrackBar volume)
+    private static Control CreateVolumePanel(CheckBox mute, VolumeSlider volume)
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         mute.Anchor = AnchorStyles.Left;
@@ -152,11 +165,7 @@ public sealed class MainForm : Form
 
         var password = passwordText.Text;
         var profile = settings.GetOrCreateHost(host);
-        profile.Port = (int)portInput.Value;
-        profile.SystemVolume = systemVolume.Value;
-        profile.MuteSystemAudio = systemMute.Checked;
-        profile.MicrophoneVolume = micVolume.Value;
-        profile.MuteMicrophone = micMute.Checked;
+        CaptureControlValues(profile);
         currentRunPasswords[host] = password;
         settings.LastHost = profile.Host;
 
@@ -204,7 +213,6 @@ public sealed class MainForm : Form
                 try
                 {
                     using var client = new TcpClient { NoDelay = true };
-                    activeClient = client;
                     await client.ConnectAsync(profile.Host, profile.Port, session.Token);
                     activityLog.Write($"TCP connected to {client.Client.RemoteEndPoint}.");
 
@@ -271,7 +279,12 @@ public sealed class MainForm : Form
                 {
                     systemPlayer.Stop();
                     micPlayer.Stop();
-                    activeClient = null;
+
+                    // A disconnect cancels the session token, which surfaces here as
+                    // an IO/cancellation error from the in-flight read. Treat it as a
+                    // clean stop rather than a connection failure to retry.
+                    if (session.IsCancellationRequested)
+                        break;
 
                     if (authenticatedAt != DateTimeOffset.MinValue
                         && DateTimeOffset.UtcNow - authenticatedAt >= TimeSpan.FromSeconds(32))
@@ -306,10 +319,6 @@ public sealed class MainForm : Form
                     activityLog.Write($"{error} Exception: {exception.GetType().Name}: {exception.Message}");
                     activityLog.Write($"Next connection attempt in {delay} second(s).");
                     await ShowRetryCountdownAsync(delay, session.Token);
-                }
-                finally
-                {
-                    activeClient = null;
                 }
             }
         }
@@ -483,11 +492,47 @@ public sealed class MainForm : Form
     {
         if (sessionCancellation is null)
             return;
+        PersistCurrentSettings();
         connectionState.Text = "Disconnecting";
         connectionQuality.Text = "Closing Connection";
         activityLog.Write("Disconnect requested; automatic retries cancelled.");
+        // Cancelling the session token unblocks the in-flight read cleanly; the
+        // socket is then closed by its using-scope. Disposing it here instead
+        // would race the read and raise a spurious IO exception.
         sessionCancellation.Cancel();
-        activeClient?.Dispose();
+    }
+
+    private void CaptureControlValues(HostProfile profile)
+    {
+        profile.Port = (int)portInput.Value;
+        profile.SystemVolume = systemVolume.Value;
+        profile.MuteSystemAudio = systemMute.Checked;
+        profile.MicrophoneVolume = micVolume.Value;
+        profile.MuteMicrophone = micMute.Checked;
+    }
+
+    // Saves the current control values so the last-used settings (volumes, mute
+    // states, port, password preference) survive a disconnect or app close.
+    private void PersistCurrentSettings()
+    {
+        var host = hostInput.Text.Trim();
+        if (string.IsNullOrWhiteSpace(host))
+            return;
+
+        var profile = settings.GetOrCreateHost(host);
+        CaptureControlValues(profile);
+        settings.LastHost = profile.Host;
+        try
+        {
+            ClientSettingsStore.SetPassword(profile, passwordText.Text, savePassword.Checked);
+            ClientSettingsStore.Save(settings);
+            RefreshHostItems(profile.Host);
+            activityLog.Write($"Saved current settings for {profile.Host}:{profile.Port}.");
+        }
+        catch (Exception exception)
+        {
+            activityLog.Write($"Current settings could not be saved: {exception.Message}");
+        }
     }
 
     private void SetConnectionInputsEnabled(bool enabled)
@@ -533,6 +578,14 @@ public sealed class MainForm : Form
         }
     }
 
+    private void UpdateLevelMeters()
+    {
+        systemMeterLevel += (systemPlayer.ReadIncomingPeak() - systemMeterLevel) * MeterSmoothing;
+        micMeterLevel += (micPlayer.ReadIncomingPeak() - micMeterLevel) * MeterSmoothing;
+        systemVolume.SetLevel(systemMeterLevel);
+        micVolume.SetLevel(micMeterLevel);
+    }
+
     private void ShowLog()
     {
         if (logForm is null || logForm.IsDisposed)
@@ -551,6 +604,7 @@ public sealed class MainForm : Form
         if (disposing)
         {
             RequestDisconnect();
+            levelTimer.Dispose();
             helpTips.Dispose();
             systemPlayer.Dispose();
             micPlayer.Dispose();
@@ -558,13 +612,11 @@ public sealed class MainForm : Form
         base.Dispose(disposing);
     }
 
-    private static TrackBar NewVolumeControl() => new()
+    private static VolumeSlider NewVolumeControl() => new()
     {
-        Minimum = 0,
-        Maximum = 100,
         Value = 100,
-        TickFrequency = 10,
-        Dock = DockStyle.Fill
+        Dock = DockStyle.Fill,
+        Margin = new Padding(3, 4, 3, 4)
     };
 
     private static Label NewValueLabel(string text) => new()
