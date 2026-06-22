@@ -20,21 +20,29 @@ public static class AudioProtocol
 
     public static async ValueTask WriteAsync(Stream stream, AudioPacket packet, CancellationToken cancellationToken)
     {
+        await stream.WriteAsync(Serialize(packet), cancellationToken);
+    }
+
+    // Produces the complete on-the-wire bytes for a packet (header + format + data)
+    // as a single buffer. Used for stream writes and for message-oriented transports
+    // such as WebSockets, where one packet is sent as one binary message.
+    public static byte[] Serialize(AudioPacket packet)
+    {
         if (packet.WaveFormat.Length is < 1 or > MaximumFormatSize)
             throw new InvalidDataException("Audio format is invalid.");
         if (packet.Data.Length > MaximumPayloadSize)
             throw new InvalidDataException("Audio packet is too large.");
 
-        var header = new byte[HeaderSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(0, 4), Magic);
-        header[4] = Version;
-        header[5] = (byte)packet.Channel;
-        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6, 2), (ushort)packet.WaveFormat.Length);
-        BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(8, 4), packet.Data.Length);
-
-        await stream.WriteAsync(header, cancellationToken);
-        await stream.WriteAsync(packet.WaveFormat, cancellationToken);
-        await stream.WriteAsync(packet.Data, cancellationToken);
+        var buffer = new byte[HeaderSize + packet.WaveFormat.Length + packet.Data.Length];
+        var span = buffer.AsSpan();
+        BinaryPrimitives.WriteUInt32LittleEndian(span[..4], Magic);
+        span[4] = Version;
+        span[5] = (byte)packet.Channel;
+        BinaryPrimitives.WriteUInt16LittleEndian(span.Slice(6, 2), (ushort)packet.WaveFormat.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(span.Slice(8, 4), packet.Data.Length);
+        packet.WaveFormat.CopyTo(span.Slice(HeaderSize, packet.WaveFormat.Length));
+        packet.Data.CopyTo(span[(HeaderSize + packet.WaveFormat.Length)..]);
+        return buffer;
     }
 
     public static async ValueTask<AudioPacket> ReadAsync(Stream stream, CancellationToken cancellationToken)

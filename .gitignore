@@ -431,3 +431,8 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Stray build/publish artifacts that can land in the service project root
+/src/PatchCast.Service/PatchCast.Service.exe
+/src/PatchCast.Service/web.config
+/src/PatchCast.Service/PatchCast.Service.staticwebassets.endpoints.json
