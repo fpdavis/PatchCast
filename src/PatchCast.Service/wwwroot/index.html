@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PatchCast Client</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <main class="card">
+        <h1>PatchCast Client</h1>
+
+        <div class="grid">
+            <label for="hostInput">Server Host Or IP:</label>
+            <div class="host-row">
+                <input id="hostInput" list="hostList" autocomplete="off" spellcheck="false" />
+                <datalist id="hostList"></datalist>
+                <button id="removeHostBtn" type="button" class="secondary" disabled>Remove</button>
+            </div>
+
+            <label for="portInput">Web Port:</label>
+            <input id="portInput" type="number" min="1" max="65535" value="4748" />
+
+            <label for="passwordInput">Server Password:</label>
+            <div class="password-row">
+                <input id="passwordInput" type="password" autocomplete="current-password" />
+                <label class="inline"><input id="savePasswordCheck" type="checkbox" /> Save</label>
+            </div>
+
+            <label for="systemVolumeSlider">System Volume:</label>
+            <div class="volume-row">
+                <input id="systemMuteCheck" type="checkbox" title="Mute system audio" />
+                <div class="volume-control">
+                    <div class="meter"><div id="systemMeterFill" class="meter-fill"></div></div>
+                    <input id="systemVolumeSlider" type="range" min="0" max="100" value="100" />
+                </div>
+            </div>
+
+            <label for="micVolumeSlider">Microphone Volume:</label>
+            <div class="volume-row">
+                <input id="micMuteCheck" type="checkbox" title="Mute microphone" />
+                <div class="volume-control">
+                    <div class="meter"><div id="micMeterFill" class="meter-fill"></div></div>
+                    <input id="micVolumeSlider" type="range" min="0" max="100" value="100" />
+                </div>
+            </div>
+
+            <span class="field-label">Status:</span>
+            <span id="statusLabel" class="value">Disconnected</span>
+
+            <span class="field-label">Connection Quality:</span>
+            <span id="qualityLabel" class="value">Not Connected</span>
+        </div>
+
+        <div class="actions">
+            <button id="showLogBtn" type="button" class="secondary">Show Log</button>
+            <button id="connectBtn" type="button">Connect</button>
+        </div>
+
+        <section id="logPanel" class="log">
+            <div id="logContent" class="log-content"></div>
+        </section>
+    </main>
+
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 
@@ -39,8 +40,21 @@ public sealed class ServerCertificateProvider(ILogger<ServerCertificateProvider>
             HashAlgorithmName.SHA256,
             RSASignaturePadding.Pkcs1);
         request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
         request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
+
+        // serverAuth EKU and a Subject Alternative Name are both required for
+        // browsers to accept the certificate for the HTTPS/WSS endpoint, even when
+        // it is manually trusted. The TCP client validates by SHA-256 pin, so these
+        // additions are compatible with both transports.
+        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            [new Oid("1.3.6.1.5.5.7.3.1")], critical: false));
+        var subjectAlternativeName = new SubjectAlternativeNameBuilder();
+        subjectAlternativeName.AddDnsName("localhost");
+        subjectAlternativeName.AddIpAddress(IPAddress.Loopback);
+        subjectAlternativeName.AddIpAddress(IPAddress.IPv6Loopback);
+        request.CertificateExtensions.Add(subjectAlternativeName.Build());
 
         using var generated = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddYears(5));
         var persisted = X509CertificateLoader.LoadPkcs12(

@@ -25,14 +25,39 @@ public static class PasswordProtocol
 
         var suppliedBytes = new byte[length];
         await stream.ReadExactlyAsync(suppliedBytes, cancellationToken);
-        var expectedBytes = Encoding.UTF8.GetBytes(expectedPassword);
-        var suppliedHash = SHA256.HashData(suppliedBytes);
-        var expectedHash = SHA256.HashData(expectedBytes);
-        var authenticated = CryptographicOperations.FixedTimeEquals(suppliedHash, expectedHash);
+        var authenticated = Verify(suppliedBytes, expectedPassword);
 
         await stream.WriteAsync(new[] { authenticated ? (byte)1 : (byte)0 }, cancellationToken);
         await stream.FlushAsync(cancellationToken);
         return authenticated;
+    }
+
+    // Parses a complete authentication request frame (magic + length + UTF-8 password
+    // bytes) such as the single binary message a WebSocket client sends. Returns the
+    // supplied password bytes, or false if the frame is malformed or oversized.
+    public static bool TryParseRequest(ReadOnlySpan<byte> request, out byte[] passwordBytes)
+    {
+        passwordBytes = [];
+        if (request.Length < 6)
+            return false;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(request[..4]) != Magic)
+            return false;
+
+        var length = BinaryPrimitives.ReadUInt16LittleEndian(request.Slice(4, 2));
+        if (length > MaximumPasswordBytes || request.Length != 6 + length)
+            return false;
+
+        passwordBytes = request.Slice(6, length).ToArray();
+        return true;
+    }
+
+    // Compares a supplied password (UTF-8 bytes) against the expected password using
+    // constant-time SHA-256 comparison, identical to the TCP authentication path.
+    public static bool Verify(ReadOnlySpan<byte> suppliedBytes, string expectedPassword)
+    {
+        var suppliedHash = SHA256.HashData(suppliedBytes);
+        var expectedHash = SHA256.HashData(Encoding.UTF8.GetBytes(expectedPassword));
+        return CryptographicOperations.FixedTimeEquals(suppliedHash, expectedHash);
     }
 
     public static async ValueTask<bool> AuthenticateClientAsync(
