@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace PatchCast.Client;
 
@@ -9,23 +8,6 @@ internal sealed class ClientSettings
 {
     public string? LastHost { get; set; }
     public List<HostProfile> Hosts { get; set; } = [];
-
-    // Version-one properties are read only to migrate existing installations.
-    [JsonPropertyName("Host")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? LegacyHost { get; set; }
-
-    [JsonPropertyName("Port")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public int? LegacyPort { get; set; }
-
-    [JsonPropertyName("ProtectedPassword")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? LegacyProtectedPassword { get; set; }
-
-    [JsonPropertyName("CertificatePins")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public Dictionary<string, string>? LegacyCertificatePins { get; set; }
 
     public HostProfile? FindHost(string host) => Hosts.FirstOrDefault(
         profile => string.Equals(profile.Host, host.Trim(), StringComparison.OrdinalIgnoreCase));
@@ -94,10 +76,6 @@ internal static class ClientSettingsStore
 
     public static void Save(ClientSettings settings)
     {
-        settings.LegacyHost = null;
-        settings.LegacyPort = null;
-        settings.LegacyProtectedPassword = null;
-        settings.LegacyCertificatePins = null;
         Directory.CreateDirectory(SettingsDirectory);
         var temporaryPath = SettingsPath + ".tmp";
         File.WriteAllText(temporaryPath, JsonSerializer.Serialize(settings, JsonOptions));
@@ -148,38 +126,7 @@ internal static class ClientSettingsStore
             profile.MicrophoneVolume = Math.Clamp(profile.MicrophoneVolume, 0, 100);
         }
 
-        if (!string.IsNullOrWhiteSpace(settings.LegacyHost))
-        {
-            var profile = settings.GetOrCreateHost(settings.LegacyHost);
-            profile.Port = Math.Clamp(settings.LegacyPort ?? 4747, 1, 65535);
-            profile.ProtectedPassword ??= settings.LegacyProtectedPassword;
-            settings.LastHost ??= profile.Host;
-        }
-
-        if (settings.LegacyCertificatePins is not null)
-        {
-            foreach (var (key, pin) in settings.LegacyCertificatePins)
-            {
-                if (!TrySplitPinKey(key, out var host, out var port))
-                    continue;
-                var profile = settings.GetOrCreateHost(host);
-                profile.Port = port;
-                profile.CertificatePin ??= pin;
-            }
-        }
-
         settings.LastHost = settings.FindHost(settings.LastHost ?? string.Empty)?.Host
             ?? settings.Hosts.FirstOrDefault()?.Host;
-    }
-
-    private static bool TrySplitPinKey(string key, out string host, out int port)
-    {
-        host = string.Empty;
-        port = 4747;
-        var separator = key.LastIndexOf(':');
-        if (separator <= 0 || !int.TryParse(key[(separator + 1)..], out port) || port is < 1 or > 65535)
-            return false;
-        host = key[..separator];
-        return !string.IsNullOrWhiteSpace(host);
     }
 }
