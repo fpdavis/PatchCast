@@ -275,6 +275,18 @@ public sealed class MainForm : Form
                 {
                     break;
                 }
+                catch (UnauthorizedAccessException)
+                {
+                    // A rejected password will not succeed on retry, so notify the
+                    // user and stop instead of looping with the same credentials.
+                    systemPlayer.Stop();
+                    micPlayer.Stop();
+                    connectionState.Text = "Disconnected";
+                    connectionQuality.Text = "Not Connected";
+                    activityLog.Write("Password rejected by the server; automatic retries stopped.");
+                    MessageBox.Show(this, "The server rejected the password.", "PatchCast", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    break;
+                }
                 catch (Exception exception)
                 {
                     systemPlayer.Stop();

@@ -6,17 +6,60 @@ using PatchCast.Protocol;
 
 namespace PatchCast.Service;
 
-// Captures system audio (loopback) and the microphone, authenticates the client,
-// then pumps audio packets to a transport-supplied sink until the client leaves.
-// Shared by the TCP listener (Worker) and the WebSocket endpoint so the capture,
-// authentication, and pump logic lives in exactly one place.
-internal sealed class AudioSession(ILogger logger)
+// Authenticates a client, then (only once authenticated) captures system audio
+// (loopback) and the microphone and pumps audio packets to a transport-supplied
+// sink until the client leaves. Shared by the TCP listener (Worker) and the
+// WebSocket endpoint so the authentication, capture, and pump logic lives in
+// exactly one place.
+internal sealed class AudioSession(ILogger logger, PasswordCooldown cooldown)
 {
     public async Task RunAsync(
         string endpoint,
         Func<CancellationToken, Task<bool>> authenticateAsync,
         Func<AudioPacket, CancellationToken, ValueTask> sendAsync,
         CancellationToken cancellationToken)
+    {
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        try
+        {
+            // Throttle every attempt by the current brute-force cooldown before the
+            // password is evaluated; the wait escalates with each prior failure.
+            await cooldown.WaitAsync(linkedCancellation.Token);
+            if (!await authenticateAsync(linkedCancellation.Token))
+            {
+                cooldown.RecordFailure();
+                logger.LogWarning(
+                    "Client {Endpoint} supplied an invalid password. Next attempt is throttled by {Seconds}s.",
+                    endpoint, (int)cooldown.CurrentDelay.TotalSeconds);
+                return;
+            }
+
+            cooldown.RecordSuccess();
+
+            // Audio devices are opened only after a client authenticates, so an idle
+            // server, an unauthenticated connection, or a port probe does no audio work.
+            await CaptureAndStreamAsync(sendAsync, linkedCancellation);
+        }
+        catch (OperationCanceledException) when (linkedCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception) when (IsExpectedClientDisconnect(exception))
+        {
+            logger.LogInformation("Client {Endpoint} closed the connection.", endpoint);
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "Client {Endpoint} disconnected or audio capture failed.", endpoint);
+        }
+        finally
+        {
+            logger.LogInformation("Client {Endpoint} disconnected.", endpoint);
+        }
+    }
+
+    private async Task CaptureAndStreamAsync(
+        Func<AudioPacket, CancellationToken, ValueTask> sendAsync,
+        CancellationTokenSource linkedCancellation)
     {
         var packets = Channel.CreateBounded<AudioPacket>(new BoundedChannelOptions(128)
         {
@@ -27,7 +70,6 @@ internal sealed class AudioSession(ILogger logger)
 
         using var loopback = new WasapiLoopbackCapture();
         using var microphone = new WasapiCapture();
-        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         var stoppingCaptures = 0;
         var loopbackStarted = false;
@@ -76,13 +118,6 @@ internal sealed class AudioSession(ILogger logger)
 
         try
         {
-            if (!await authenticateAsync(linkedCancellation.Token))
-            {
-                logger.LogWarning("Client {Endpoint} supplied an invalid password.", endpoint);
-                await Task.Delay(TimeSpan.FromSeconds(1), linkedCancellation.Token);
-                return;
-            }
-
             loopback.StartRecording();
             loopbackStarted = true;
             microphone.StartRecording();
@@ -90,17 +125,6 @@ internal sealed class AudioSession(ILogger logger)
 
             await foreach (var packet in packets.Reader.ReadAllAsync(linkedCancellation.Token))
                 await sendAsync(packet, linkedCancellation.Token);
-        }
-        catch (OperationCanceledException) when (linkedCancellation.IsCancellationRequested)
-        {
-        }
-        catch (Exception exception) when (IsExpectedClientDisconnect(exception))
-        {
-            logger.LogInformation("Client {Endpoint} closed the connection.", endpoint);
-        }
-        catch (Exception exception)
-        {
-            logger.LogWarning(exception, "Client {Endpoint} disconnected or audio capture failed.", endpoint);
         }
         finally
         {
@@ -114,7 +138,6 @@ internal sealed class AudioSession(ILogger logger)
             if (microphoneStarted)
                 microphone.StopRecording();
             packets.Writer.TryComplete();
-            logger.LogInformation("Client {Endpoint} disconnected.", endpoint);
         }
     }
 
