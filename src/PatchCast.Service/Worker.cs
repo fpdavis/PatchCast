@@ -11,7 +11,8 @@ namespace PatchCast.Service;
 public sealed class Worker(
     ILogger<Worker> logger,
     IOptions<PatchCastOptions> options,
-    ServerCertificateProvider certificateProvider) : BackgroundService
+    ServerCertificateProvider certificateProvider,
+    PasswordCooldown passwordCooldown) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -60,7 +61,7 @@ public sealed class Worker(
         using (client)
         using (var secureStream = new SslStream(client.GetStream(), leaveInnerStreamOpen: false))
         {
-            var session = new AudioSession(logger);
+            var session = new AudioSession(logger, passwordCooldown);
             await session.RunAsync(
                 endpoint,
                 async cancellationToken =>

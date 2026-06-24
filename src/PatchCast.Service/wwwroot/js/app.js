@@ -177,7 +177,10 @@ function openSocket() {
         socket.send(buildAuthFrame(ui.password.value));
     };
     socket.onmessage = (event) => handleMessage(event.data);
-    socket.onerror = () => log('WebSocket error (the server may be unreachable or the certificate untrusted).');
+    socket.onerror = () => {
+        if (!userDisconnect)
+            log('WebSocket error (the server may be unreachable or the certificate untrusted).');
+    };
     socket.onclose = () => handleClose();
 }
 
@@ -191,7 +194,11 @@ function handleMessage(payload) {
             log('Password rejected by the server.');
             setStatus('Password rejected');
             userDisconnect = true; // do not auto-retry a bad password
-            socket.close();
+            const closing = socket;
+            socket = null;
+            finalize();
+            if (closing) { try { closing.close(); } catch { /* ignore */ } }
+            window.alert('The server rejected the password.');
             return;
         }
         authenticated = true;
@@ -215,23 +222,30 @@ function handleMessage(payload) {
 
 function handleClose() {
     clearTimers();
-    disposeStreams();
     authenticated = false;
     socket = null;
 
     if (userDisconnect) {
-        setStatus('Disconnected');
-        ui.quality.textContent = 'Not Connected';
-        ui.connect.textContent = 'Connect';
-        setConnectionInputsEnabled(true);
-        stopMeters();
+        finalize();
         return;
     }
 
+    disposeStreams();
     const delay = RETRY_DELAYS[retryIndex];
     retryIndex = Math.min(retryIndex + 1, RETRY_DELAYS.length - 1);
     log(`Connection lost. Next attempt in ${delay} second(s).`);
     scheduleReconnect(delay);
+}
+
+// Resets audio and the UI to the disconnected state. Idempotent, so it is safe to
+// call immediately on a user disconnect and again when the socket finally closes.
+function finalize() {
+    stopMeters();
+    disposeStreams();
+    setStatus('Disconnected');
+    ui.quality.textContent = 'Not Connected';
+    ui.connect.textContent = 'Connect';
+    setConnectionInputsEnabled(true);
 }
 
 function scheduleReconnect(delaySeconds) {
@@ -255,10 +269,13 @@ function disconnect() {
     persistProfile();
     log('Disconnect requested.');
     clearTimers();
-    if (socket !== null)
-        socket.close();
-    else
-        handleClose();
+    authenticated = false;
+    // Reset the UI and audio immediately rather than waiting on the WebSocket
+    // close handshake, then close the socket in the background.
+    const closing = socket;
+    socket = null;
+    finalize();
+    if (closing) { try { closing.close(); } catch { /* ignore */ } }
 }
 
 function startStableTimer() {

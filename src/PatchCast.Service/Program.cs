@@ -19,6 +19,7 @@ else
 }
 
 builder.Services.Configure<PatchCastOptions>(builder.Configuration.GetSection(PatchCastOptions.SectionName));
+builder.Services.AddSingleton<PasswordCooldown>();
 builder.Services.AddHostedService<Worker>();
 
 var patchCastOptions = builder.Configuration.GetSection(PatchCastOptions.SectionName).Get<PatchCastOptions>() ?? new PatchCastOptions();
@@ -45,8 +46,9 @@ app.UseStaticFiles();
 app.Map("/ws", async context =>
 {
     var options = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<PatchCastOptions>>();
+    var cooldown = app.Services.GetRequiredService<PasswordCooldown>();
     var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("PatchCast.WebSocket");
-    await WebSocketEndpoint.HandleAsync(context, options.Value, logger);
+    await WebSocketEndpoint.HandleAsync(context, options.Value, cooldown, logger);
 });
 
 await app.RunAsync();
